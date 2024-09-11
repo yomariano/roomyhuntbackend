@@ -12,7 +12,6 @@ const { initializeApp } = firebaseApp;
 const { collection, addDoc, getDocs,setDoc, updateDoc, getFirestore, where, orderBy,limit,query, serverTimestamp, arrayUnion , doc} = firebaseFirestore;
 const { getStorage, ref, uploadString, getDownloadURL } = firebaseStorage;
 
-const api_key = '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';
 const promptQuestion = `Generate a response in JSON format containing the following information: If the following text has location, description of the apartment, price and availability date. If not, return null object like in javascript. For instance, Location should be a city name, village, county or town. Description may look something like what the apartment look like,for instance: squares meters, number of rooms, toilets, etc. Otherise return a json object with those columns mentioned before. Resolve the country field based on the phone number (eg. if starts with 54 is Argentina, if it starts with 353 is Ireland) or location .Only return the json object with fields in camel case as country, location, description, price, availability date, isLooking. keys should be enclosed in double quotes and you must return only a json object for example { \"field1\": \"value\" }' If the message is saying something like \"I'm looking for\" or \"estoy buscando\" or something similar then return an extra variable in the json object called \"isLooking\" with values true or false.`;
 
 const firebaseConfig = {
@@ -95,12 +94,12 @@ client.on('qr', qr => {
 client.on('authenticated', (session) => {
     console.log('Authenticated!');
     console.log(session);
-    // authData = session;
-    // fs.writeFile(authFile, JSON.stringify(session), function (err) {
-    //     if (err) {
-    //         console.error(err);
-    //     }
-    // });
+    authData = session;
+    fs.writeFile(authFile, JSON.stringify(session), function (err) {
+        if (err) {
+            console.error(err);
+        }
+    });
 });
 
 
