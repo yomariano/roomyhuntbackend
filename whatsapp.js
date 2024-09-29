@@ -1,28 +1,25 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const fs = require('fs');
-const firebaseApp = require('firebase/app');
-const firebaseFirestore = require('firebase/firestore');
-const firebaseStorage = require('firebase/storage');
-const fetch = require('cross-fetch');
-require('dotenv').config();
-const qrcode = require('qrcode-terminal');
+console.log('Script started');
 
-// Then, when you need to use functions or variables, destructure them from the required module:
-const { initializeApp } = firebaseApp;
-const { collection, addDoc, getDocs,setDoc, updateDoc, getFirestore, where, orderBy,limit,query, serverTimestamp, arrayUnion , doc} = firebaseFirestore;
-const { getStorage, ref, uploadString, getDownloadURL } = firebaseStorage;
+import pkg from 'whatsapp-web.js';
+const { Client, LocalAuth,NoAuth } = pkg; // Update import to include LocalAuth
+import fs from 'fs-extra';
+import fetch from 'cross-fetch';
+import qrcode from 'qrcode-terminal';
+import { supabase } from './config.js';
+import { HfInference } from "@huggingface/inference";
 
-const promptQuestion = `Generate a response in JSON format containing the following information: If the following text has location, description of the apartment, price and availability date. If not, return null object like in javascript. For instance, Location should be a city name, village, county or town. Description may look something like what the apartment look like,for instance: squares meters, number of rooms, toilets, etc. Otherise return a json object with those columns mentioned before. Resolve the country field based on the phone number (eg. if starts with 54 is Argentina, if it starts with 353 is Ireland) or location .Only return the json object with fields in camel case as country, location, description, price, availability date, isLooking. keys should be enclosed in double quotes and you must return only a json object for example { \"field1\": \"value\" }' If the message is saying something like \"I'm looking for\" or \"estoy buscando\" or something similar then return an extra variable in the json object called \"isLooking\" with values true or false.`;
 
-const firebaseConfig = {
-    apiKey: process.env.PUBLIC_API_KEY,
-    authDomain: process.env.PUBLIC_AUTH_DOMAIN,
-    projectId: process.env.PUBLIC_PROJECT_ID,
-    storageBucket: process.env.PUBLIC_STORAGE_BUCKET,
-    messagingSenderId: process.env.PUBLIC_MESSAGING_SENDER_ID,
-    appId: process.env.PUBLIC_APP_ID,
-    measurementId: process.env.PUBLIC_MEASUREMENT_ID
-};
+console.log('Imports completed');
+
+const promptQuestion = `Generate a response in JSON format containing the following information: If the following text has location, description of the apartment, price and availability date. If not, return null object like in javascript. For instance, Location should be a city name, village, county or town. Description may look something like what the apartment look like,for instance: squares meters, number of rooms, toilets, etc. Otherise return a json object with those columns mentioned before. Resolve the country field based on the phone number (eg. if starts with 54 is Argentina, if it starts with 353 is Ireland) or location. Only return the json object with fields in camel case as country, location, description, price, availabilityDate, isLooking. keys should be enclosed in double quotes and you must return only a json object for example { \"field1\": \"value\" }' If the message is saying something like \"I'm looking for\" or \"estoy buscando\" or something similar then return an extra variable in the json object called \"isLooking\" with values true or false. The response should be a valid JSON object with the following structure:
+{
+  "country": string,
+  "location": string,
+  "description": string,
+  "price": number,
+  "availabilityDate": string,
+  "isLooking": boolean
+}`;
 
 const FILE_TYPES = {
     IMAGE: ['image/jpeg', 'image/png', 'image/gif'],
@@ -36,103 +33,146 @@ const UPLOAD_PATHS = {
     DOCUMENT: 'applications'
 };
 
-// Initialize Firebase
-const app = initializeApp(firebaseConfig);
+// Custom Supabase store
+class SupabaseStore {
+    constructor() {
+        console.log('SupabaseStore initialized');
+    }
 
+    async sessionExists({ session }) {
+        console.log('Checking if session exists:', session);
+        try {
+            const { data, error } = await supabase
+                .from('whatsapp_sessions')
+                .select('session_data')
+                .eq('session_name', session)
+                .single();
+            
+            if (error) {
+                if (error.code === 'PGRST116') {
+                    // This error means no rows were found, which is fine
+                    console.log('No existing session found');
+                    return false;
+                }
+                // For other errors, we should still throw
+                throw error;
+            }
+            
+            console.log('Session exists:', !!data);
+            return !!data;
+        } catch (error) {
+            console.error('Error checking session existence:', error);
+            return false;
+        }
+    }
 
-// Initialize Cloud Firestore and get a reference to the service
-const db = getFirestore(app);
-// Initialize Cloud Storage and get a reference to the service
-const storage = getStorage(app);
+    async save({ session, data }) {
+        console.log('Attempting to save session:', session);
+        try {
+            console.log('Session data type:', typeof data);
+            console.log('Session data length:', data ? JSON.stringify(data).length : 'N/A');
+            console.log('Session data content:', data);
+            
+            // Ensure data is always stored as a string
+            const dataToSave = data ? JSON.stringify(data) : '{}';
+            
+            const { error } = await supabase
+                .from('whatsapp_sessions')
+                .upsert({ 
+                    session_name: session, 
+                    session_data: dataToSave 
+                }, { onConflict: 'session_name' });
 
-// Path where the session data will be stored
-const authFile = './auth_info.json';
+            if (error) throw error;
+            console.log('Session saved successfully');
+        } catch (error) {
+            console.error('Error saving session:', error);
+            throw error;
+        }
+    }
+    
+    async delete({ session }) {
+        console.log('Attempting to delete session:', session);
+        try {
+            const { error } = await supabase
+                .from('whatsapp_sessions')
+                .delete()
+                .eq('session_name', session);
+            if (error) throw error;
+            console.log('Session deleted successfully');
+        } catch (error) {
+            console.error('Error deleting session:', error);
+            throw error;
+        }
+    }
 
-let authData = null;
-if (fs.existsSync(authFile)) {
-    console.log(authFile)
-    authData = JSON.parse(fs.readFileSync(authFile));
-} else {
-    authData = {};
+    async destroy() {
+        console.log('SupabaseStore destroy method called');
+        // Implement any cleanup logic here if needed
+    }
 }
 
+// Instantiate the SupabaseStore
+const store = new SupabaseStore();
+console.log('SupabaseStore instantiated');
 
 // Use the saved values
 const client = new Client({
-    session: authData,
-    authTimeoutMs: 5 * 60 * 1000,
-    restartOnAuthFail: true,
+    authStrategy: new LocalAuth(),
     puppeteer: {
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-extensions',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--single-process', // <- this one doesn't works in Windows
-            '--disable-gpu'
-        ]
-    },
-    // Use the local authentication strategy
-    authStrategy: new LocalAuth({
-        // Path to the authentication file
-        authFile
-    })
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-extensions'],
+        timeout: 60000 // Increase timeout to 60 seconds
+
+    }
 });
+
+console.log('WhatsApp client instance created');
 
 client.on('qr', qr => {
-    console.log(qr);
-
+    console.log('QR Code received, scan it to authenticate');
     qrcode.generate(qr, { small: true });
-    console.log(qr);
-
 });
 
-// Save session values to the file upon successful auth
-client.on('authenticated', (session) => {
-    console.log('Authenticated!');
-    console.log(session);
-    authData = session;
-    fs.writeFile(authFile, JSON.stringify(session), function (err) {
-        if (err) {
-            console.error(err);
-        }
-    });
+client.on('authenticated', () => {
+    console.log('Client authenticated');
 });
-
 
 client.on('auth_failure', msg => {
-    // Fired if session restore was unsuccessful
-    console.error('AUTHENTICATION FAILURE', msg);
+    console.error('Authentication failure:', msg);
 });
 
-client.on('ready', async () => {
-    console.log('Client is ready!');
-
+client.on('ready', () => {
+    console.log('Client is ready');
 });
+
+client.initialize().then(() => {
+    console.log('WhatsApp client initialized successfully');
+}).catch(error => {
+    console.error('Failed to initialize WhatsApp client:', error);
+});
+
+console.log('Client initialization started');
 
 client.on('message', async (msg) => {
     console.log(msg.from);
 
-   if (msg.from === 'status@broadcast' || /@c/.test(msg.from)) return;
-    
+    if (msg.from === 'status@broadcast' || /@c/.test(msg.from)) return;
+
     console.log(msg);
-    //await addDoc(collection(db, 'rawmessages'), JSON.parse(JSON.stringify(msg)));
+    // await supabase.from('rawmessages').insert([{ ...msg }]);
 
     const collectionName = 'preAdverts';
     const phoneNumber = msg?.author ? msg?.author : parseWhatsAppId(msg?.from);
-    let docRefId = null;
-    let media = null;
+    let mediaURL = null;
     let chatGptResponse = { phoneNumber };
 
     console.log(msg.hasMedia);
     if (msg.hasMedia) {
         try {
-            media = await msg.downloadMedia();
-            docRefId = await fileUpload(media);
-            chatGptResponse.media = { url: docRefId, mimetype: media.mimetype };
+            const media = await msg.downloadMedia();
+            mediaURL = await fileUpload(media);
+            chatGptResponse.media = mediaURL;
         } catch (error) {
             logError(error);
             console.error("Error downloading media: ", error);
@@ -149,77 +189,54 @@ client.on('message', async (msg) => {
         try {
             const response = await fetchOpenAiApi(prompt);
             if (response) {
-               // const cleanedText = cleanJsonString(response.choices[0].text);
                 const parsedText = JSON.parse(response.response);
                 Object.assign(chatGptResponse, parsedText);
                 console.log(chatGptResponse)
-
             }
         } catch (error) {
             logError(error);
             console.error("Error fetching data from API endpoint: ", error);
         }
-
-        // chatGptResponse = {
-        //     phoneNumber: '353838454183@c.us',
-        //     timestamp: msg?.timestamp,
-        //     country: 'Argentina',
-        //     originalMsg: '*Featured property of the week at House and Flats!*🔥\n' +
-        //       'Modern and bright apartment in Villa Crespo, a few blocks from Plaza Serrano with Patio🍃 \n' +    
-        //       'Available🗓️\n'  +
-        //       'Monthly price: 820 $USD\n' +
-        //       '\n' +
-        //       'Secure your extended stays in the city through our platform 🏠✨ \n' +
-        //       ' *Book rooms or apartments with monthly stays*🌎💼\n' +
-        //       '✅ Automatic reservations and payment methods tailored for foreigners.\n' +
-        //       '✅ Personalized assistance.\n' +
-        //       '✅ Save time and rent with security in your favorite destinations.\n' +
-        //       '✅ Enjoy our benefits, such as included transportation upon arrival at the airport and discounts at' +
-        //       ' www.houseandflats.com',
-        //     location: 'Villa Crespo',
-        //     description: 'Modern and bright apartment with patio located a few blocks from Plaza Serrano.',       
-        //     price: 820,
-        //     availabilityDate: 'available',
-        //     isLooking: true
-        //   }
     }
 
     try {
-        await updateOrCreateDocument(collectionName, chatGptResponse);
-        console.log("Document successfully updated/created!");
+        await upsertDocument(collectionName, chatGptResponse);
+        console.log("Document successfully upserted!");
     } catch (error) {
         logError(error);
-        console.error("Error updating/creating document: ", error);
+        console.error("Error upserting document: ", error);
     }
 });
 
+// Add more debug logging
+process.on('unhandledRejection', (reason, promise) => {
+    console.log('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
 async function fetchOpenAiApi(prompt) {
-    const response = await fetch('http://localhost:8080/api/generate', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            model: "llama2",
-            prompt: prompt,
-            stream: false,
-            format: "json"
-          })
-    });
-    console.log(response)
+    console.log(prompt);
 
-    if (!response.ok) {
-        throw new Error('Failed to fetch from OpenAI API');
+    const inference = new HfInference(process.env.HUGGINGFACE_API_TOKEN);
+
+    try {
+        const response = await inference.textGeneration({
+            model: "openai-community/gpt2",
+            inputs: prompt,
+            parameters: {
+                max_new_tokens: 250,
+            },
+        });
+
+        console.log(response);
+
+        return { response: response.generated_text };
+    } catch (error) {
+        console.error("Error fetching data from API endpoint: ", error);
+        throw error;
     }
-    let r = await response.json();
-    console.log(r);
-
-    return r;
 }
 
-
-
-
+// Ensure 'fileUpload' is declared only once
 const fileUpload = async (media) => {
     console.log(media?.mimetype);
     let path = '';
@@ -238,18 +255,26 @@ const fileUpload = async (media) => {
     }
 
     const fileName = media.filename || generateRandomName(new Date().getTime());
-    const storageRef = ref(storage, `${path}/${fileName}`);
+    const filePath = `${path}/${fileName}`;
 
     try {
-        await uploadString(storageRef, `data:text/plain;base64,${media.data}`, 'data_url');
+        const { data, error } = await supabase.storage.from('your-bucket-name').upload(filePath, Buffer.from(media.data, 'base64'), {
+            contentType: mimeType,
+            upsert: true
+        });
+        if (error) {
+            throw error;
+        }
+        const { publicURL, error: urlError } = supabase.storage.from('your-bucket-name').getPublicUrl(filePath);
+        if (urlError) {
+            throw urlError;
+        }
+        return publicURL;
     } catch (error) {
         logError(error);
-        console.error("Error:", error);
+        console.error("Error uploading file: ", error);
         throw error; // re-throw the error so that it can be handled by the calling function
     }
-
-    const downloadURL = await getDownloadURL(storageRef);
-    return downloadURL;
 }
 
 
@@ -269,9 +294,9 @@ function generateRandomName(seed) {
     let timestamp = seed.toString();
 
     while (name.length < 10) {
-        const index = timestamp.charAt(timestamp.length - 1);
+        const index = parseInt(timestamp.charAt(timestamp.length - 1)) % characters.length;
         name += characters.charAt(index);
-        timestamp = Math.floor(timestamp / characters.length).toString();
+        timestamp = Math.floor(parseInt(timestamp) / characters.length).toString();
     }
 
     return name;
@@ -287,54 +312,62 @@ function cleanJsonString(jsonString) {
     return cleanedString;
 }
 
-async function updateOrCreateDocument(collectionName, chatGptResponse) {
-    const collectionRef = collection(db, collectionName);
-    const phoneNumberQuery = query(collectionRef, where("phoneNumber", "==", chatGptResponse.phoneNumber),
-    orderBy("timestamp", "desc"), // Order by timestamp in descending order
-    limit(1) // Limit to the newest record);
-    );
-    const querySnapshot = await getDocs(phoneNumberQuery);
-    
+async function upsertDocument(tableName, chatGptResponse) {
+    const { data: existingRecords, error: fetchError } = await supabase
+        .from(tableName)
+        .select('*')
+        .eq('phoneNumber', chatGptResponse.phoneNumber)
+        .order('timestamp', { ascending: false })
+        .limit(1);
+
+    if (fetchError) {
+        throw fetchError;
+    }
+
     let documentToUpdate = null;
-    querySnapshot.forEach(doc => {
-        const data = doc.data();
+    if (existingRecords.length > 0) {
+        const existingRecord = existingRecords[0];
         console.log(chatGptResponse.timestamp);
-        console.log(data.timestamp);
-        console.log(chatGptResponse.timestamp - data.timestamp);
-        // Assuming chatGptResponse.timestamp and data.timestamp are Unix timestamps in milliseconds
-        if (Math.abs(chatGptResponse.timestamp - data.timestamp) < 15) { // 30 seconds difference
-            documentToUpdate = doc;
+        console.log(existingRecord.timestamp);
+        console.log(chatGptResponse.timestamp - existingRecord.timestamp);
+        // Assuming chatGptResponse.timestamp and existingRecord.timestamp are Unix timestamps in milliseconds
+        if (Math.abs(chatGptResponse.timestamp - existingRecord.timestamp) < 15000) { // 15 seconds difference
+            documentToUpdate = existingRecord;
         }
-    });
-
-
+    }
 
     if (documentToUpdate) {
         // Update the existing document
-        const docRef = doc(db, collectionName, documentToUpdate.id);
-        // Use buildUpdateObject to prepare the document data
-        const updateData = buildUpdateObject(chatGptResponse);
-        await updateDoc(docRef, updateData);
+        const { data, error } = await supabase
+            .from(tableName)
+            .update(buildUpdateObject(chatGptResponse))
+            .eq('id', documentToUpdate.id);
+        if (error) {
+            throw error;
+        }
     } else {
-        // Use buildUpdateObject to prepare the document data
-        const updateData = buildUpdateObject(chatGptResponse);
-        // Create a new document
-        await addDoc(collectionRef, updateData);
+        // Insert a new document
+        const { data, error } = await supabase
+            .from(tableName)
+            .insert([buildUpdateObject(chatGptResponse)]);
+        if (error) {
+            throw error;
+        }
     }
-
-  
-    
 }
 
 function buildUpdateObject(chatGptResponse) {
-    const fields = ["phoneNumber", "location", "timestamp", "description", 
-                    "availabilityDate", "price", "country", "media", "isLooking"];
+    const fields = ["phoneNumber", "location", "timestamp", "description",
+        "availabilityDate", "price", "country", "media", "isLooking"];
     const updateObj = {};
 
     fields.forEach(field => {
-        if (chatGptResponse[field]) {
+        if (chatGptResponse[field] !== undefined) {
             if (field === "media" || field === "isLooking") {
-                updateObj[field] = arrayUnion(chatGptResponse[field]);
+                if (!updateObj[field]) {
+                    updateObj[field] = [];
+                }
+                updateObj[field].push(chatGptResponse[field]);
             } else {
                 updateObj[field] = chatGptResponse[field];
             }
@@ -345,10 +378,10 @@ function buildUpdateObject(chatGptResponse) {
 }
 
 async function logError(error) {
-    const collectionRef = collection(db, "errors");
-    await addDoc(collectionRef, { error: JSON.stringify(error, Object.getOwnPropertyNames(error)) });
+    const { data, error: insertError } = await supabase.from("errors").insert([
+        { error: error.message || JSON.stringify(error, Object.getOwnPropertyNames(error)) }
+    ]);
+    if (insertError) {
+        console.error("Failed to log error:", insertError);
+    }
 }
-
-
-
-client.initialize();
