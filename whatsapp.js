@@ -1,25 +1,24 @@
 console.log('Script started');
 
 import pkg from 'whatsapp-web.js';
-const { Client, LocalAuth,NoAuth } = pkg; // Update import to include LocalAuth
-import fs from 'fs-extra';
+const { Client, LocalAuth } = pkg; // Update import to include LocalAuth
 import fetch from 'cross-fetch';
 import qrcode from 'qrcode-terminal';
 import { supabase } from './config.js';
-import { HfInference } from "@huggingface/inference";
+import { HfInference } from '@huggingface/inference';
+import { exec } from 'child_process';
+import util from 'util';
+
 
 
 console.log('Imports completed');
 
-const promptQuestion = `Generate a response in JSON format containing the following information: If the following text has location, description of the apartment, price and availability date. If not, return null object like in javascript. For instance, Location should be a city name, village, county or town. Description may look something like what the apartment look like,for instance: squares meters, number of rooms, toilets, etc. Otherise return a json object with those columns mentioned before. Resolve the country field based on the phone number (eg. if starts with 54 is Argentina, if it starts with 353 is Ireland) or location. Only return the json object with fields in camel case as country, location, description, price, availabilityDate, isLooking. keys should be enclosed in double quotes and you must return only a json object for example { \"field1\": \"value\" }' If the message is saying something like \"I'm looking for\" or \"estoy buscando\" or something similar then return an extra variable in the json object called \"isLooking\" with values true or false. The response should be a valid JSON object with the following structure:
-{
-  "country": string,
-  "location": string,
-  "description": string,
-  "price": number,
-  "availabilityDate": string,
-  "isLooking": boolean
-}`;
+//const promptQuestion = `Generate a response in JSON format containing the following information: If the following text has location, description of the apartment, price and availability date. If not, return null object like in javascript. For instance, Location should be a city name, village, county or town. Description may look something like what the apartment look like,for instance: squares meters, number of rooms, toilets, etc. Otherise return a json object with those columns mentioned before. Resolve the country field based on the phone number (eg. if starts with 54 is Argentina, if it starts with 353 is Ireland) or location. Only return the json object with fields in camel case as country, location, description, price, availabilityDate, isLooking. keys should be enclosed in double quotes and you must return only a json object for example { \"field1\": \"value\" }' If the message is saying something like \"I'm looking for\" or \"estoy buscando\" or something similar then return an extra variable in the json object called \"isLooking\" with values true or false. The response should be a valid JSON object`;
+const promptQuestion = `Generate a valid JSON response containing the following fields: country, location, description, price, availabilityDate, and isLooking. If the field is missing from the input, return null. The message is between <<< and >>>. Please ensure the response is a valid JSON object.
+
+Message: <<<`;
+
+const hf = new HfInference(process.env.HUGGINGFACE_API_KEY);
 
 const FILE_TYPES = {
     IMAGE: ['image/jpeg', 'image/png', 'image/gif'],
@@ -121,10 +120,15 @@ const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
         headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-extensions'],
-        timeout: 60000 // Increase timeout to 60 seconds
-
-    }
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-extensions',
+          '--disable-gpu',
+          '--disable-dev-shm-usage'
+        ],
+        timeout: 60000
+      }
 });
 
 console.log('WhatsApp client instance created');
@@ -160,9 +164,7 @@ client.on('message', async (msg) => {
     if (msg.from === 'status@broadcast' || /@c/.test(msg.from)) return;
 
     console.log(msg);
-    // await supabase.from('rawmessages').insert([{ ...msg }]);
 
-    const collectionName = 'preAdverts';
     const phoneNumber = msg?.author ? msg?.author : parseWhatsAppId(msg?.from);
     let mediaURL = null;
     let chatGptResponse = { phoneNumber };
@@ -174,37 +176,34 @@ client.on('message', async (msg) => {
             mediaURL = await fileUpload(media);
             chatGptResponse.media = mediaURL;
         } catch (error) {
-            logError(error);
             console.error("Error downloading media: ", error);
-            // Handle the error or continue processing other parts of the message
         }
     }
 
-    chatGptResponse.timestamp = msg?.timestamp;
+    chatGptResponse.timestamp = new Date(msg?.timestamp * 1000).toISOString();
     chatGptResponse.country = msg?.country;
 
     if (msg.body) {
         chatGptResponse.originalMsg = msg.body;
-        const prompt = `${promptQuestion} ${msg.body}`;
+        const prompt = `${promptQuestion}${msg.body}>>>`;
         try {
             const response = await fetchOpenAiApi(prompt);
             if (response) {
-                const parsedText = JSON.parse(response.response);
-                Object.assign(chatGptResponse, parsedText);
-                console.log(chatGptResponse)
+                Object.assign(chatGptResponse, response);
+                console.log('ChatGPT Response:', chatGptResponse);
+            } else {
+                console.log('No response from ChatGPT');
             }
         } catch (error) {
-            logError(error);
             console.error("Error fetching data from API endpoint: ", error);
         }
     }
 
     try {
-        await upsertDocument(collectionName, chatGptResponse);
-        console.log("Document successfully upserted!");
+        await upsertDocument(chatGptResponse);
+        console.log("Message successfully stored in preAdvertsJsonb");
     } catch (error) {
-        logError(error);
-        console.error("Error upserting document: ", error);
+        console.error("Error storing message in preAdvertsJsonb: ", error);
     }
 });
 
@@ -213,25 +212,59 @@ process.on('unhandledRejection', (reason, promise) => {
     console.log('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-async function fetchOpenAiApi(prompt) {
-    console.log(prompt);
+process.on('SIGTERM', () => {
+    client.destroy();
+    process.exit(0);
+  });
 
-    const inference = new HfInference(process.env.HUGGINGFACE_API_TOKEN);
+  process.on('SIGINT', () => {
+    client.destroy();
+    process.exit(0);
+  });
+
+const execPromise = util.promisify(exec);
+
+async function fetchOpenAiApi(prompt) {
+    console.log('Prompt:', prompt);
+
+    const curlCommand = `curl -X POST http://localhost:1234/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "Trelis/Llama-2-7b-chat-hf-function-calling-v2/llama-2-7b-function-calling.Q3_K_M.gguf",
+      "messages": [
+        {
+          "role": "user",
+          "content": ${JSON.stringify(prompt)}
+        }
+      ],
+      "temperature": 0.7,
+      "max_tokens": 500
+    }'`;
 
     try {
-        const response = await inference.textGeneration({
-            model: "openai-community/gpt2",
-            inputs: prompt,
-            parameters: {
-                max_new_tokens: 250,
-            },
-        });
+        const { stdout, stderr } = await execPromise(curlCommand);
+        
+        if (stderr) {
+            console.error('Curl command error:', stderr);
+        }
 
-        console.log(response);
+        console.log('Raw API response:', stdout);
 
-        return { response: response.generated_text };
+        const response = JSON.parse(stdout);
+        const content = response.choices[0].message.content;
+
+        console.log('Parsed content:', content);
+
+        // Attempt to parse the content as JSON
+        try {
+            const parsedContent = JSON.parse(content);
+            return parsedContent;
+        } catch (parseError) {
+            console.error('Error parsing content as JSON:', parseError);
+            return null;
+        }
     } catch (error) {
-        console.error("Error fetching data from API endpoint: ", error);
+        console.error('Error executing curl command:', error);
         throw error;
     }
 }
@@ -258,14 +291,14 @@ const fileUpload = async (media) => {
     const filePath = `${path}/${fileName}`;
 
     try {
-        const { data, error } = await supabase.storage.from('your-bucket-name').upload(filePath, Buffer.from(media.data, 'base64'), {
+        const { data, error } = await supabase.storage.from('roomyHuntMedia').upload(filePath, Buffer.from(media.data, 'base64'), {
             contentType: mimeType,
             upsert: true
         });
         if (error) {
             throw error;
         }
-        const { publicURL, error: urlError } = supabase.storage.from('your-bucket-name').getPublicUrl(filePath);
+        const { publicURL, error: urlError } = supabase.storage.from('roomyHuntMedia').getPublicUrl(filePath);
         if (urlError) {
             throw urlError;
         }
@@ -312,69 +345,59 @@ function cleanJsonString(jsonString) {
     return cleanedString;
 }
 
-async function upsertDocument(tableName, chatGptResponse) {
-    const { data: existingRecords, error: fetchError } = await supabase
-        .from(tableName)
-        .select('*')
-        .eq('phoneNumber', chatGptResponse.phoneNumber)
-        .order('timestamp', { ascending: false })
-        .limit(1);
+async function upsertDocument(chatGptResponse) {
+    const { phoneNumber, timestamp, ...otherFields } = chatGptResponse;
+    
+    const message = {
+        phoneNumber,
+        timestamp: new Date(timestamp).toISOString(),
+        ...otherFields
+    };
 
-    if (fetchError) {
-        throw fetchError;
-    }
-
-    let documentToUpdate = null;
-    if (existingRecords.length > 0) {
-        const existingRecord = existingRecords[0];
-        console.log(chatGptResponse.timestamp);
-        console.log(existingRecord.timestamp);
-        console.log(chatGptResponse.timestamp - existingRecord.timestamp);
-        // Assuming chatGptResponse.timestamp and existingRecord.timestamp are Unix timestamps in milliseconds
-        if (Math.abs(chatGptResponse.timestamp - existingRecord.timestamp) < 15000) { // 15 seconds difference
-            documentToUpdate = existingRecord;
-        }
-    }
-
-    if (documentToUpdate) {
-        // Update the existing document
+    try {
         const { data, error } = await supabase
-            .from(tableName)
-            .update(buildUpdateObject(chatGptResponse))
-            .eq('id', documentToUpdate.id);
-        if (error) {
-            throw error;
-        }
-    } else {
-        // Insert a new document
-        const { data, error } = await supabase
-            .from(tableName)
-            .insert([buildUpdateObject(chatGptResponse)]);
-        if (error) {
-            throw error;
-        }
+            .from('preAdvertsJsonb')
+            .insert({ message })
+            .select();
+
+        if (error) throw error;
+        console.log("Document successfully inserted:", data);
+        return data;
+    } catch (error) {
+        console.error("Error inserting document: ", error);
+        throw error;
     }
 }
 
-function buildUpdateObject(chatGptResponse) {
-    const fields = ["phoneNumber", "location", "timestamp", "description",
-        "availabilityDate", "price", "country", "media", "isLooking"];
-    const updateObj = {};
+async function getRecentMessages(limit = 10) {
+    try {
+        const { data, error } = await supabase
+            .from('preAdvertsJsonb')
+            .select('*')
+            .order('created_at', { ascending: false })
+            .limit(limit);
 
-    fields.forEach(field => {
-        if (chatGptResponse[field] !== undefined) {
-            if (field === "media" || field === "isLooking") {
-                if (!updateObj[field]) {
-                    updateObj[field] = [];
-                }
-                updateObj[field].push(chatGptResponse[field]);
-            } else {
-                updateObj[field] = chatGptResponse[field];
-            }
-        }
-    });
+        if (error) throw error;
+        return data;
+    } catch (error) {
+        console.error("Error fetching recent messages: ", error);
+        throw error;
+    }
+}
 
-    return updateObj;
+async function searchMessages(searchTerm) {
+    try {
+        const { data, error } = await supabase
+            .from('preAdvertsJsonb')
+            .select('*')
+            .filter('message->>originalMsg', 'ilike', `%${searchTerm}%`);
+
+        if (error) throw error;
+        return data;
+    } catch (error) {
+        console.error("Error searching messages: ", error);
+        throw error;
+    }
 }
 
 async function logError(error) {
