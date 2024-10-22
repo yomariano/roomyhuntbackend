@@ -5,20 +5,19 @@ const { Client, LocalAuth } = pkg; // Update import to include LocalAuth
 import fetch from 'cross-fetch';
 import qrcode from 'qrcode-terminal';
 import { supabase } from './config.js';
-import { HfInference } from '@huggingface/inference';
 import { exec } from 'child_process';
 import util from 'util';
+import dotenv from 'dotenv';
+import { setTimeout } from 'timers/promises';
 
 
+dotenv.config(); // Load environment variables from .env file
 
 console.log('Imports completed');
 
-//const promptQuestion = `Generate a response in JSON format containing the following information: If the following text has location, description of the apartment, price and availability date. If not, return null object like in javascript. For instance, Location should be a city name, village, county or town. Description may look something like what the apartment look like,for instance: squares meters, number of rooms, toilets, etc. Otherise return a json object with those columns mentioned before. Resolve the country field based on the phone number (eg. if starts with 54 is Argentina, if it starts with 353 is Ireland) or location. Only return the json object with fields in camel case as country, location, description, price, availabilityDate, isLooking. keys should be enclosed in double quotes and you must return only a json object for example { \"field1\": \"value\" }' If the message is saying something like \"I'm looking for\" or \"estoy buscando\" or something similar then return an extra variable in the json object called \"isLooking\" with values true or false. The response should be a valid JSON object`;
-const promptQuestion = `Generate a valid JSON response containing the following fields: country, location, description, price, availabilityDate, and isLooking. If the field is missing from the input, return null. The message is between <<< and >>>. Please ensure the response is a valid JSON object.
+//const promptQuestion = `Generate a valid JSON response containing the following fields: country, location, description, price, availabilityDate, and isLooking. If the field is missing from the input, return null. The message is between <<< and >>>. Please ensure the response is a valid JSON object.
+const promptQuestion = `Generate a response in JSON format containing the following information: If the following text has location, description of the apartment, price and availability date. If not, return null object like in javascript. For instance, Location should be a city name, village, county or town. Description may look something like what the apartment look like,for instance: squares meters, number of rooms, toilets, etc. Otherise return a json object with those columns mentioned before. Resolve the country field based on the phone number (eg. if starts with 54 is Argentina, if it starts with 353 is Ireland) or location .Only return the json object with fields in camel case as country, location, description, price, availability date, isLooking. keys should be enclosed in double quotes and you must return only a json object for example { \"field1\": \"value\" }' If the message is saying something like \"I'm looking for\" or \"estoy buscando\" or something similar then return an extra variable in the json object called \"isLooking\" with values true or false.`;
 
-Message: <<<`;
-
-const hf = new HfInference(process.env.HUGGINGFACE_API_KEY);
 
 const FILE_TYPES = {
     IMAGE: ['image/jpeg', 'image/png', 'image/gif'],
@@ -27,10 +26,10 @@ const FILE_TYPES = {
 };
 
 const UPLOAD_PATHS = {
-    IMAGE: 'images',
-    VIDEO: 'videos',
-    DOCUMENT: 'applications'
-};
+    IMAGE: 'public',
+    VIDEO: 'public',
+    DOCUMENT: 'public'
+  };
 
 // Custom Supabase store
 class SupabaseStore {
@@ -150,61 +149,82 @@ client.on('ready', () => {
     console.log('Client is ready');
 });
 
-client.initialize().then(() => {
-    console.log('WhatsApp client initialized successfully');
-}).catch(error => {
-    console.error('Failed to initialize WhatsApp client:', error);
+// Modify the client initialization
+async function initializeClient() {
+    while (true) {
+        try {
+            await client.initialize();
+            console.log('WhatsApp client initialized successfully');
+            return;
+        } catch (error) {
+            console.error('Failed to initialize WhatsApp client:', error);
+            console.log('Retrying in 30 seconds...');
+            await setTimeout(3000);
+        }
+    }
+}
+
+// Replace the existing client.initialize() call with:
+initializeClient();
+
+// Modify the message event handler
+client.on('message', async (msg) => {
+    try {
+        console.log(msg.from);
+
+        if (msg.from === 'status@broadcast' || /@c/.test(msg.from)) return;
+
+        const phoneNumber = msg?.author ? msg?.author : parseWhatsAppId(msg?.from);
+        let chatGptResponse = await getRecentChatGptResponse(phoneNumber);
+        console.log("line 164 => ", chatGptResponse);
+        if (!chatGptResponse) {
+            chatGptResponse = { phoneNumber, media: [] };
+        }
+
+        // Update timestamp for each message
+        chatGptResponse.timestamp = new Date(msg?.timestamp * 1000).toISOString();
+        chatGptResponse.country = msg?.country;
+
+        if (msg.hasMedia) {
+            try {
+                const media = await msg.downloadMedia();
+                const mediaURL = await fileUpload(media);
+                chatGptResponse.media.push(mediaURL);
+            } catch (error) {
+                console.error("Error downloading media: ", error);
+            }
+        }
+
+        if (msg.body) {
+            chatGptResponse.originalMsg = msg.body;
+            const prompt = `${promptQuestion}${msg.body}`;
+            try {
+                const response = await fetchOpenAiApi(prompt);
+                if (response) {
+                    Object.assign(chatGptResponse, response);
+                } else {
+                    console.log('No response from ChatGPT');
+                }
+            } catch (error) {
+                console.error("Error fetching data from API endpoint: ", error);
+            }
+        }
+
+        try {
+            await upsertDocument(chatGptResponse);
+        } catch (error) {
+            console.error("Error storing message in preAdvertsJsonb: ", error);
+        }
+    } catch (error) {
+        console.error('Error processing message:', error);
+        await logError(error);
+    }
 });
 
-console.log('Client initialization started');
-
-client.on('message', async (msg) => {
-    console.log(msg.from);
-
-    if (msg.from === 'status@broadcast' || /@c/.test(msg.from)) return;
-
-    console.log(msg);
-
-    const phoneNumber = msg?.author ? msg?.author : parseWhatsAppId(msg?.from);
-    let mediaURL = null;
-    let chatGptResponse = { phoneNumber };
-
-    console.log(msg.hasMedia);
-    if (msg.hasMedia) {
-        try {
-            const media = await msg.downloadMedia();
-            mediaURL = await fileUpload(media);
-            chatGptResponse.media = mediaURL;
-        } catch (error) {
-            console.error("Error downloading media: ", error);
-        }
-    }
-
-    chatGptResponse.timestamp = new Date(msg?.timestamp * 1000).toISOString();
-    chatGptResponse.country = msg?.country;
-
-    if (msg.body) {
-        chatGptResponse.originalMsg = msg.body;
-        const prompt = `${promptQuestion}${msg.body}>>>`;
-        try {
-            const response = await fetchOpenAiApi(prompt);
-            if (response) {
-                Object.assign(chatGptResponse, response);
-                console.log('ChatGPT Response:', chatGptResponse);
-            } else {
-                console.log('No response from ChatGPT');
-            }
-        } catch (error) {
-            console.error("Error fetching data from API endpoint: ", error);
-        }
-    }
-
-    try {
-        await upsertDocument(chatGptResponse);
-        console.log("Message successfully stored in preAdvertsJsonb");
-    } catch (error) {
-        console.error("Error storing message in preAdvertsJsonb: ", error);
-    }
+// Add a disconnected event handler
+client.on('disconnected', (reason) => {
+    console.log('Client was disconnected', reason);
+    initializeClient();
 });
 
 // Add more debug logging
@@ -212,66 +232,97 @@ process.on('unhandledRejection', (reason, promise) => {
     console.log('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-process.on('SIGTERM', () => {
-    client.destroy();
-    process.exit(0);
-  });
-
-  process.on('SIGINT', () => {
-    client.destroy();
-    process.exit(0);
-  });
-
 const execPromise = util.promisify(exec);
 
 async function fetchOpenAiApi(prompt) {
     console.log('Prompt:', prompt);
 
-    const curlCommand = `curl -X POST http://localhost:1234/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -d '{
-      "model": "Trelis/Llama-2-7b-chat-hf-function-calling-v2/llama-2-7b-function-calling.Q3_K_M.gguf",
-      "messages": [
-        {
-          "role": "user",
-          "content": ${JSON.stringify(prompt)}
-        }
-      ],
-      "temperature": 0.7,
-      "max_tokens": 500
-    }'`;
+    const payload = {
+        model: getModel(), // Use the function to get the model
+        messages: [
+            {
+                role: "user",
+                content: prompt
+            }
+        ],
+        response_format: {
+            type: "json_schema",
+            json_schema: {
+                name: "response",
+                strict: "true",
+                schema: {
+                    type: "object",
+                    properties: {
+                        country: {
+                            type: "string"
+                        },
+                        location: {
+                            type: "string"
+                        },
+                        description: {
+                            type: "string"
+                        },
+                        price: {
+                            type: "string"
+                        },
+                        availabilityDate: {
+                            type: "string"
+                        },
+                        isLooking: {
+                            type: "boolean"
+                        }
+                    },
+                    required: ["country", "location", "description", "price", "availabilityDate", "isLooking"]
+                }
+            }
+        },
+        temperature: 0.7,
+        max_tokens: 500,
+        stream: false
+    };
 
     try {
-        const { stdout, stderr } = await execPromise(curlCommand);
-        
-        if (stderr) {
-            console.error('Curl command error:', stderr);
-        }
+        const response = await fetch(process.env.MODEL_API_URL || "llama-2-7b-function-calling", {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        });
 
-        console.log('Raw API response:', stdout);
-
-        const response = JSON.parse(stdout);
-        const content = response.choices[0].message.content;
-
-        console.log('Parsed content:', content);
-
-        // Attempt to parse the content as JSON
-        try {
-            const parsedContent = JSON.parse(content);
-            return parsedContent;
-        } catch (parseError) {
-            console.error('Error parsing content as JSON:', parseError);
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('API response error:', errorText);
             return null;
         }
+
+        const responseData = await response.json();
+        console.log('API response:', responseData);
+
+        if (responseData.choices && responseData.choices.length > 0) {
+            const content = responseData.choices[0].message.content;
+            console.log('Parsed content:', content);
+
+            try {
+                return JSON.parse(content);
+            } catch (parseError) {
+                console.error('Error parsing content as JSON:', parseError);
+                return null;
+            }
+        } else {
+            console.log('No choices in API response');
+            return null;
+        }
+
     } catch (error) {
-        console.error('Error executing curl command:', error);
-        throw error;
+        console.error('Error fetching data from API endpoint:', error);
+        await logError(error);
+        return null;
     }
 }
 
 // Ensure 'fileUpload' is declared only once
 const fileUpload = async (media) => {
-    console.log(media?.mimetype);
     let path = '';
 
     const mimeType = media?.mimetype;
@@ -284,7 +335,7 @@ const fileUpload = async (media) => {
         path = UPLOAD_PATHS.DOCUMENT;
     } else {
         console.error("Unsupported file type.");
-        return;
+        return null;
     }
 
     const fileName = media.filename || generateRandomName(new Date().getTime());
@@ -295,18 +346,29 @@ const fileUpload = async (media) => {
             contentType: mimeType,
             upsert: true
         });
+        
         if (error) {
+            console.error("Supabase upload error:", error);
             throw error;
         }
-        const { publicURL, error: urlError } = supabase.storage.from('roomyHuntMedia').getPublicUrl(filePath);
+        
+        // Get the public URL for the uploaded file
+        const { data: { publicUrl }, error: urlError } = supabase
+            .storage
+            .from('roomyHuntMedia')
+            .getPublicUrl(filePath);
+
         if (urlError) {
+            console.error("Error getting public URL:", urlError);
             throw urlError;
         }
-        return publicURL;
+
+        // Return the full public URL
+        return publicUrl;
     } catch (error) {
-        logError(error);
-        console.error("Error uploading file: ", error);
-        throw error; // re-throw the error so that it can be handled by the calling function
+        console.error("Detailed upload error:", error);
+        await logError(error);
+        return null;
     }
 }
 
@@ -348,24 +410,84 @@ function cleanJsonString(jsonString) {
 async function upsertDocument(chatGptResponse) {
     const { phoneNumber, timestamp, ...otherFields } = chatGptResponse;
     
-    const message = {
+    let message = {
         phoneNumber,
         timestamp: new Date(timestamp).toISOString(),
         ...otherFields
     };
 
-    try {
-        const { data, error } = await supabase
-            .from('preAdvertsJsonb')
-            .insert({ message })
-            .select();
+    // Parse the AI response if it's a string
+    if (typeof message.content === 'string') {
+        try {
+            const parsedContent = JSON.parse(message.content);
+            message = { ...message, ...parsedContent };
+        } catch (error) {
+            console.error("Error parsing AI response:", error);
+        }
+    }
 
-        if (error) throw error;
-        console.log("Document successfully inserted:", data);
-        return data;
+    try {
+        // Fetch the most recent message from this phone number
+        const { data: existingData, error: fetchError } = await supabase
+            .from('preAdvertsJsonb')
+            .select('*')
+            .eq('message->>phoneNumber', phoneNumber)
+            .order('message->>timestamp', { ascending: false })
+            .limit(1)
+            .single();
+
+        if (fetchError && fetchError.code !== 'PGRST116') {
+            throw fetchError;
+        }
+
+        let result;
+        if (existingData) {
+            const existingTimestamp = new Date(existingData.message.timestamp);
+            const incomingTimestamp = new Date(message.timestamp);
+            const timeDifference = Math.abs(incomingTimestamp - existingTimestamp);
+
+            if (timeDifference <= 15000) { // 15 seconds in milliseconds
+                // If within 15 seconds, update the existing record
+                const existingMedia = existingData.message.media || [];
+                const newMedia = message.media || [];
+                const updatedMedia = [...new Set([...existingMedia, ...newMedia])]; // Remove duplicates
+
+                const updatedMessage = {
+                    ...existingData.message,
+                    ...message,
+                    media: updatedMedia
+                };
+                const { data, error } = await supabase
+                    .from('preAdvertsJsonb')
+                    .update({ message: updatedMessage })
+                    .eq('id', existingData.id)
+                    .select();
+                if (error) throw error;
+                result = data;
+            } else {
+                // If more than 15 seconds, insert a new record
+                const { data, error } = await supabase
+                    .from('preAdvertsJsonb')
+                    .insert({ message })
+                    .select();
+                if (error) throw error;
+                result = data;
+            }
+        } else {
+            // If no existing message, insert a new record
+            const { data, error } = await supabase
+                .from('preAdvertsJsonb')
+                .insert({ message })
+                .select();
+            if (error) throw error;
+            result = data;
+        }
+
+        console.log("Document successfully upserted:", result);
+        return result;
     } catch (error) {
-        console.error("Error inserting document: ", error);
-        throw error;
+        console.error("Error upserting document: ", error);
+        await logError(error);
     }
 }
 
@@ -408,3 +530,40 @@ async function logError(error) {
         console.error("Failed to log error:", insertError);
     }
 }
+
+async function getRecentChatGptResponse(phoneNumber) {
+    const timeDifference = new Date(Date.now() - 15000).toISOString();
+    try {
+        const { data, error } = await supabase
+            .from('preAdvertsJsonb')
+            .select('*')
+            .eq('message->>phoneNumber', phoneNumber)
+            .gte('message->>timestamp', timeDifference)
+            .order('message->>timestamp', { ascending: false })
+            .limit(1)
+            .single();
+
+        if (error) {
+            if (error.code === 'PGRST116') {
+                // No recent message found
+                return null;
+            }
+            throw error;
+        }
+
+        return data.message;
+    } catch (error) {
+        console.error("Error fetching recent ChatGPT response: ", error);
+        return null;
+    }
+}
+
+function getModel() {
+    return process.env.AI_MODEL || "llama-2-7b-function-calling";
+}
+
+// Add a global error handler
+process.on('uncaughtException', async (error) => {
+    console.error('Uncaught Exception:', error);
+    await logError(error);
+});
